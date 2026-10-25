@@ -33,14 +33,93 @@ CRON_HOUR=$(echo "$USER_TIME" | cut -d: -f1)
 CRON_MIN=$((10#$CRON_MIN))
 CRON_HOUR=$((10#$CRON_HOUR))
 
-# Путь к команде x-ui
-CMD_GEO="x-ui update-all-geofiles"
+# --- Создание скрипта-обёртки с откатом ---
+WRAPPER="/usr/local/bin/xui-geofiles-update.sh"
 
-# Формируем строку для cron без логирования (вывод перенаправлен в /dev/null)
-C_JOB="$CRON_MIN $CRON_HOUR * * * $CMD_GEO > /dev/null 2>&1"
+cat > "$WRAPPER" <<'EOF'
+#!/bin/bash
+# Обновление геофайлов X-UI с автоматическим откатом, если Xray не запустился
 
-# Удаляем старые задачи с обновлением геофайлов x-ui (если они были) и добавляем новую
-(crontab -l 2>/dev/null | grep -v "$CMD_GEO" ; echo "$C_JOB") | crontab -
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+XUI_DIR="/usr/local/x-ui"
+BIN_DIR="$XUI_DIR/bin"
+WAIT_SEC=30   # сколько секунд ждать запуска Xray после обновления
+
+log() { logger -t xui-geofiles "$*"; }
+
+# Защита от параллельного запуска
+exec 9>/var/lock/xui-geofiles.lock
+flock -n 9 || exit 0
+
+if [ ! -d "$BIN_DIR" ]; then
+    log "Каталог $BIN_DIR не найден, выход"
+    exit 1
+fi
+
+# Проверка: Xray запущен и сервис x-ui активен
+xray_ok() {
+    local i
+    for ((i = 0; i < WAIT_SEC; i += 2)); do
+        if systemctl is-active --quiet x-ui && pgrep -f 'xray-linux' > /dev/null; then
+            # Xray должен продержаться несколько секунд (не падать сразу)
+            sleep 5
+            systemctl is-active --quiet x-ui && pgrep -f 'xray-linux' > /dev/null && return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# 1. Резервная копия текущих геофайлов
+BACKUP_DIR=$(mktemp -d /tmp/xui-geo-backup.XXXXXX) || exit 1
+trap 'rm -rf "$BACKUP_DIR"' EXIT
+
+shopt -s nullglob
+GEO_FILES=("$BIN_DIR"/geoip*.dat "$BIN_DIR"/geosite*.dat)
+shopt -u nullglob
+
+if [ ${#GEO_FILES[@]} -eq 0 ]; then
+    log "Геофайлы в $BIN_DIR не найдены, выход"
+    exit 1
+fi
+cp -a "${GEO_FILES[@]}" "$BACKUP_DIR"/
+
+# 2. Обновление
+x-ui update-all-geofiles > /dev/null 2>&1
+UPDATE_RC=$?
+
+# На случай, если x-ui сам не перезапустил сервис
+systemctl restart x-ui > /dev/null 2>&1
+
+# 3. Проверка
+if [ $UPDATE_RC -eq 0 ] && xray_ok; then
+    log "Геофайлы обновлены, Xray работает"
+    exit 0
+fi
+
+# 4. Откат
+log "Ошибка после обновления (код $UPDATE_RC) или Xray не запустился — откат геофайлов"
+cp -af "$BACKUP_DIR"/*.dat "$BIN_DIR"/
+systemctl restart x-ui > /dev/null 2>&1
+
+if xray_ok; then
+    log "Откат выполнен, Xray работает"
+else
+    log "ВНИМАНИЕ: после отката Xray всё равно не запустился, проверьте вручную"
+fi
+exit 1
+EOF
+
+chmod +x "$WRAPPER"
+
+# Формируем строку для cron без логирования (вывод перенаправлен в /dev/null, результат пишется в syslog через logger)
+C_JOB="$CRON_MIN $CRON_HOUR * * * $WRAPPER > /dev/null 2>&1"
+
+# Удаляем старые задачи (прямой вызов x-ui и прошлую версию обёртки) и добавляем новую
+(crontab -l 2>/dev/null | grep -v -e "x-ui update-all-geofiles" -e "$WRAPPER" ; echo "$C_JOB") | crontab -
 
 echo -e "${B_GREEN}Задача cron успешно создана!${NC}"
-echo -e "Геофайлы будут обновляться ежедневно в ${B_CYAN}${USER_TIME}${NC} без сохранения логов."
+echo -e "Геофайлы будут обновляться ежедневно в ${B_CYAN}${USER_TIME}${NC}."
+echo -e "Если Xray не запустится после обновления, геофайлы будут восстановлены автоматически."
+echo -e "Результат смотрите так: ${B_CYAN}journalctl -t xui-geofiles${NC}"
